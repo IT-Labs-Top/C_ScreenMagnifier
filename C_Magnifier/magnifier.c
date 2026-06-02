@@ -71,13 +71,25 @@ static int   g_fps    = 30;
 static HWND  g_hwndHost = NULL;
 static HWND  g_hwndMag  = NULL;
 
-/* Перетаскивание */
-static BOOL  g_dragging = FALSE;
-static POINT g_dragStart;       /* позиция курсора (screen) при начале drag */
-static POINT g_wndStart;        /* позиция окна при начале drag */
+#define BORDER_PX 3
+/* Цвет рамки: средне-серый #888888 — виден и на светлом и на тёмном фоне */
+#define BORDER_RGB RGB(136, 136, 136)
 
-#define HOTKEY_QUIT  1
-#define TIMER_RENDER 1
+/* Перетаскивание / клик-сквозь-лупу */
+static BOOL  g_pressed   = FALSE;   /* кнопка нажата, ещё не решили drag/tap */
+static BOOL  g_dragging  = FALSE;   /* движение превысило порог — это перетаскивание */
+static POINT g_dragStart;           /* позиция курсора (screen) при начале drag */
+static POINT g_wndStart;            /* позиция окна при начале drag */
+static POINT g_savedCursor;         /* куда вернуть курсор после клика-сквозь */
+
+/* Порог в пикселях: меньше — считаем тапом (кликом), больше — перетаскиванием */
+#define DRAG_THRESHOLD 8
+/* Сколько держать лупу «прозрачной» для мыши, чтобы синтетический клик дошёл */
+#define CLICK_THROUGH_MS 80
+
+#define HOTKEY_QUIT   1
+#define TIMER_RENDER  1
+#define TIMER_UNCLICK 2
 
 /* ------------------------------------------------------------------ */
 /* Обновление источника — показываем область экрана под центром окна   */
@@ -98,6 +110,47 @@ static void RefreshSourceFromWindowPos(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Клик «сквозь лупу»: тап по увеличенному элементу должен нажать      */
+/* реальный элемент под ним. Из-за зума видимая точка `cur` отвечает   */
+/* реальной точке  real = center + (cur - center) / zoom.             */
+/*                                                                     */
+/* Чтобы синтетический клик попал не в саму лупу, а в окно под ней,    */
+/* временно делаем окно прозрачным для мыши (WS_EX_TRANSPARENT) —      */
+/* лупа при этом остаётся видимой (без мелькания). Через таймер флаг   */
+/* снимаем, чтобы снова работало перетаскивание.                       */
+/* ------------------------------------------------------------------ */
+static void ForwardClickThroughMagnifier(void)
+{
+    POINT cur;
+    GetCursorPos(&cur);
+
+    RECT wr;
+    GetWindowRect(g_hwndHost, &wr);
+    int cx = (wr.left + wr.right) / 2;
+    int cy = (wr.top  + wr.bottom) / 2;
+
+    int rx = cx + (int)((cur.x - cx) / g_zoom);
+    int ry = cy + (int)((cur.y - cy) / g_zoom);
+
+    g_savedCursor = cur;
+
+    /* Делаем лупу прозрачной для hit-testing — клик пройдёт насквозь */
+    LONG ex = GetWindowLongA(g_hwndHost, GWL_EXSTYLE);
+    SetWindowLongA(g_hwndHost, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT);
+
+    /* Синтетический клик в реальную точку под увеличенным элементом */
+    SetCursorPos(rx, ry);
+    INPUT in[2];
+    ZeroMemory(in, sizeof(in));
+    in[0].type = INPUT_MOUSE; in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    in[1].type = INPUT_MOUSE; in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    SendInput(2, in, sizeof(INPUT));
+
+    /* Через короткую паузу вернём непрозрачность и курсор */
+    SetTimer(g_hwndHost, TIMER_UNCLICK, CLICK_THROUGH_MS, NULL);
+}
+
+/* ------------------------------------------------------------------ */
 /* Оконная процедура                                                   */
 /* ------------------------------------------------------------------ */
 static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg,
@@ -105,9 +158,10 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg,
 {
     switch (msg)
     {
-    /* ── Начало перетаскивания (мышь) ─────────────────────────── */
+    /* ── Нажатие: ещё не знаем, тап это или перетаскивание ─────── */
     case WM_LBUTTONDOWN: {
-        g_dragging = TRUE;
+        g_pressed  = TRUE;
+        g_dragging = FALSE;
         SetCapture(hwnd);
         GetCursorPos(&g_dragStart);
         RECT wr;
@@ -118,28 +172,49 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg,
     }
 
     case WM_MOUSEMOVE: {
-        if (!g_dragging) break;
+        if (!g_pressed) break;
         POINT cur;
         GetCursorPos(&cur);
-        int nx = g_wndStart.x + (cur.x - g_dragStart.x);
-        int ny = g_wndStart.y + (cur.y - g_dragStart.y);
-        SetWindowPos(hwnd, NULL, nx, ny, 0, 0,
-            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        RefreshSourceFromWindowPos();
-        return 0;
-    }
-
-    case WM_LBUTTONUP: {
+        /* Сдвиг превысил порог — это перетаскивание, а не клик */
+        if (!g_dragging &&
+            (abs(cur.x - g_dragStart.x) > DRAG_THRESHOLD ||
+             abs(cur.y - g_dragStart.y) > DRAG_THRESHOLD))
+            g_dragging = TRUE;
         if (g_dragging) {
-            g_dragging = FALSE;
-            ReleaseCapture();
+            int nx = g_wndStart.x + (cur.x - g_dragStart.x);
+            int ny = g_wndStart.y + (cur.y - g_dragStart.y);
+            SetWindowPos(hwnd, NULL, nx, ny, 0, 0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            RefreshSourceFromWindowPos();
         }
         return 0;
     }
 
-    /* ── Фоновый таймер: обновляем контент под лупой ─────────── */
+    case WM_LBUTTONUP: {
+        if (g_pressed) {
+            g_pressed = FALSE;
+            ReleaseCapture();
+            /* Нажали и отпустили без движения — это тап: */
+            /* пробрасываем клик на реальный элемент под лупой */
+            if (!g_dragging)
+                ForwardClickThroughMagnifier();
+            g_dragging = FALSE;
+        }
+        return 0;
+    }
+
+    /* ── Таймеры ─────────────────────────────────────────────── */
     case WM_TIMER: {
-        RefreshSourceFromWindowPos();
+        if (wParam == TIMER_RENDER) {
+            RefreshSourceFromWindowPos();
+        }
+        else if (wParam == TIMER_UNCLICK) {
+            KillTimer(hwnd, TIMER_UNCLICK);
+            /* Возвращаем непрозрачность для мыши и курсор на место */
+            LONG ex = GetWindowLongA(hwnd, GWL_EXSTYLE);
+            SetWindowLongA(hwnd, GWL_EXSTYLE, ex & ~WS_EX_TRANSPARENT);
+            SetCursorPos(g_savedCursor.x, g_savedCursor.y);
+        }
         return 0;
     }
 
@@ -242,29 +317,24 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev,
     wc.lpfnWndProc   = HostProc;
     wc.hInstance     = hInst;
     wc.hCursor       = LoadCursor(NULL, IDC_SIZEALL);
-    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.hbrBackground = CreateSolidBrush(BORDER_RGB);
     wc.lpszClassName = "MagHost";
     if (!RegisterClassExA(&wc)) { MagUninitialize(); return 1; }
 
-    int d = g_radius * 2;
+    int d  = g_radius * 2;              /* magnifier content diameter */
+    int dh = d + BORDER_PX * 2;        /* host window diameter (with border) */
 
     /* Начальная позиция — центр экрана */
     int sx = GetSystemMetrics(SM_CXSCREEN);
     int sy = GetSystemMetrics(SM_CYSCREEN);
-    int startX = (sx - d) / 2;
-    int startY = (sy - d) / 2;
+    int startX = (sx - dh) / 2;
+    int startY = (sy - dh) / 2;
 
-    /*
-     * WS_EX_TOPMOST  — поверх всех окон
-     * WS_EX_LAYERED  — для SetLayeredWindowAttributes
-     * БЕЗ WS_EX_TRANSPARENT — окно получает ввод (для перетаскивания)
-     * БЕЗ WS_EX_NOACTIVATE — чтобы получать mouse/touch события
-     */
     g_hwndHost = CreateWindowExA(
         WS_EX_TOPMOST | WS_EX_LAYERED,
         "MagHost", NULL,
         WS_POPUP | WS_VISIBLE,
-        startX, startY, d, d,
+        startX, startY, dh, dh,
         NULL, NULL, hInst, NULL);
 
     if (!g_hwndHost) { MagUninitialize(); return 1; }
@@ -272,14 +342,21 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev,
     SetLayeredWindowAttributes(g_hwndHost, 0, 255, LWA_ALPHA);
 
     /* Круглая форма — клики вне круга проходят к интерфейсу */
-    HRGN hRgn = CreateEllipticRgn(0, 0, d, d);
+    HRGN hRgn = CreateEllipticRgn(0, 0, dh, dh);
     SetWindowRgn(g_hwndHost, hRgn, FALSE);
 
+    /* Magnifier child — inset by BORDER_PX, so host background shows as border */
     g_hwndMag = CreateWindowA(
         WC_MAGNIFIER, NULL,
         WS_CHILD | WS_VISIBLE,
-        0, 0, d, d,
+        BORDER_PX, BORDER_PX, d, d,
         g_hwndHost, NULL, hInst, NULL);
+
+    /* Clip magnifier child to circle — so host's round border is visible */
+    {
+        HRGN hMagRgn = CreateEllipticRgn(0, 0, d, d);
+        SetWindowRgn(g_hwndMag, hMagRgn, FALSE);
+    }
 
     if (!g_hwndMag) {
         DestroyWindow(g_hwndHost);
